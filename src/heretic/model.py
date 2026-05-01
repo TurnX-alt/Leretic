@@ -30,7 +30,8 @@ from transformers.generation import (
 )
 
 from .config import QuantizationMethod, RowNormalization, Settings
-from .utils import Prompt, batchify, empty_cache, print
+from .system import empty_cache
+from .utils import Prompt, batchify, print
 
 
 def get_model_class(
@@ -61,12 +62,17 @@ class Model:
         self.settings = settings
         self.needs_reload = False
 
+        self.revision_kwargs = {}
+        if settings.model_commit is not None:
+            self.revision_kwargs["revision"] = settings.model_commit
+
         print()
         print(f"Loading model [bold]{settings.model}[/]...")
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             settings.model,
             trust_remote_code=settings.trust_remote_code,
+            **self.revision_kwargs,
         )
 
         # Fallback for tokenizers that don't declare a special pad token.
@@ -107,6 +113,7 @@ class Model:
                     device_map=settings.device_map,
                     max_memory=self.max_memory,
                     trust_remote_code=self.trusted_models.get(settings.model),
+                    **self.revision_kwargs,
                     **extra_kwargs,
                 )
 
@@ -168,18 +175,19 @@ class Model:
         # across layers (e.g. "o_proj" on attention layers, "out_proj" on linear attention layers).
         target_modules_set: set[str] = set()
 
-        for layer_index, layer in enumerate(self.get_layers()):
-            module_id_to_leaf_name = {
-                id(module): module_name.split(".")[-1]
-                for module_name, module in layer.named_modules()
-            }
+        module_id_to_full_name = {
+            id(module): module_name
+            for module_name, module in self.model.named_modules()
+        }
 
+        for layer_index in range(len(self.get_layers())):
             for modules in self.get_layer_modules(layer_index).values():
                 for module in modules:
-                    if id(module) in module_id_to_leaf_name:
-                        target_modules_set.add(module_id_to_leaf_name[id(module)])
+                    full_name = module_id_to_full_name.get(id(module))
+                    if full_name is not None:
+                        target_modules_set.add(full_name)
 
-        target_modules = list(target_modules_set)
+        target_modules = sorted(target_modules_set)
 
         if self.settings.row_normalization != RowNormalization.FULL:
             # Rank 1 is sufficient for directional ablation without renormalization.
@@ -203,7 +211,10 @@ class Model:
         # so the result is a PeftModel rather than a PeftMixedModel.
         self.model = cast(PeftModel, get_peft_model(self.model, self.peft_config))
 
-        print(f"* LoRA adapters initialized (targets: {', '.join(target_modules)})")
+        display_targets = sorted({name.rsplit(".", 1)[-1] for name in target_modules})
+        print(
+            f"* LoRA adapters initialized (target types: {', '.join(display_targets)})"
+        )
 
     def _get_quantization_config(self, dtype: str) -> BitsAndBytesConfig | None:
         """
@@ -252,6 +263,7 @@ class Model:
                 torch_dtype=self.model.dtype,
                 device_map="cpu",
                 trust_remote_code=self.trusted_models.get(self.settings.model),
+                **self.revision_kwargs,
             )
 
             # Apply LoRA adapters to the CPU model
@@ -313,6 +325,7 @@ class Model:
             device_map=self.settings.device_map,
             max_memory=self.max_memory,
             trust_remote_code=self.trusted_models.get(self.settings.model),
+            **self.revision_kwargs,
             **extra_kwargs,
         )
 
@@ -631,6 +644,9 @@ class Model:
             max_new_tokens=1,
             output_hidden_states=True,
             return_dict_in_generate=True,
+            # KV cache is unnecessary here because we only need the hidden states
+            # for the first generated token.
+            use_cache=False,
         )
 
         # This cast is valid because GenerateDecoderOnlyOutput is the return type
@@ -664,7 +680,11 @@ class Model:
                 dim=2,
                 keepdim=True,
             )
-            return torch.clamp(residuals, -thresholds, thresholds)
+            residuals = torch.clamp(residuals, -thresholds, thresholds)
+
+        if self.settings.offload_outputs_to_cpu:
+            residuals = residuals.cpu()
+            empty_cache()
 
         return residuals
 
@@ -676,6 +696,30 @@ class Model:
 
         return torch.cat(residuals, dim=0)
 
+    def get_residuals_mean(self, prompts: list[Prompt]) -> Tensor:
+        if not prompts:
+            raise ValueError("prompts must not be empty")
+
+        running_sum = None
+        total_count = 0
+
+        for batch in batchify(prompts, self.settings.batch_size):
+            batch_residuals = self.get_residuals(batch)
+
+            # Accumulate in high precision on CPU to reduce peak VRAM usage.
+            batch_sum = batch_residuals.sum(dim=0, dtype=torch.float64).cpu()
+
+            if running_sum is None:
+                running_sum = batch_sum
+            else:
+                running_sum += batch_sum
+
+            total_count += batch_residuals.shape[0]
+
+        assert running_sum is not None
+
+        return (running_sum / total_count).to(torch.float32)
+
     # We work with logprobs rather than probabilities for numerical stability
     # when computing the KL divergence.
     def get_logprobs(self, prompts: list[Prompt]) -> Tensor:
@@ -686,6 +730,7 @@ class Model:
             max_new_tokens=1,
             output_scores=True,
             return_dict_in_generate=True,
+            use_cache=False,
         )
 
         # This cast is valid because GenerateDecoderOnlyOutput is the return type
@@ -697,7 +742,15 @@ class Model:
         logits = cast(tuple[FloatTensor], outputs.scores)[0]
 
         # The returned tensor has shape (prompt, token).
-        return F.log_softmax(logits, dim=-1)
+        logprobs = F.log_softmax(logits, dim=-1)
+
+        del outputs
+
+        if self.settings.offload_outputs_to_cpu:
+            logprobs = logprobs.cpu()
+            empty_cache()
+
+        return logprobs
 
     def get_logprobs_batched(self, prompts: list[Prompt]) -> Tensor:
         logprobs = []

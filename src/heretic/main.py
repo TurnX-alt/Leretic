@@ -3,6 +3,20 @@
 
 # ruff: noqa: E402
 
+import sys
+
+from .config import Settings
+
+
+def _is_help_invocation() -> bool:
+    args = sys.argv[1:]
+    return "-h" in args or "--help" in args
+
+
+# Parse and handle CLI help before importing heavyweight ML/runtime dependencies.
+if _is_help_invocation():
+    Settings()  # ty:ignore[missing-argument]
+
 from .progress import patch_tqdm
 
 # This patches tqdm class definitions, which must happen
@@ -12,7 +26,7 @@ patch_tqdm()
 import logging
 import math
 import os
-import sys
+import random
 import time
 import warnings
 from dataclasses import asdict
@@ -29,13 +43,6 @@ import questionary
 import torch
 import torch.nn.functional as F
 import transformers
-from accelerate.utils import (
-    is_mlu_available,
-    is_musa_available,
-    is_npu_available,
-    is_sdaa_available,
-    is_xpu_available,
-)
 from huggingface_hub import ModelCard, ModelCardData
 from lm_eval.models.huggingface import HFLM
 from optuna import Trial, TrialPruned
@@ -51,14 +58,15 @@ from rich.table import Table
 from rich.traceback import install
 
 from .analyzer import Analyzer
-from .config import QuantizationMethod, Settings
+from .config import QuantizationMethod
 from .evaluator import Evaluator
 from .model import AbliterationParameters, Model, get_model_class
+from .system import empty_cache, get_accelerator_info
 from .utils import (
-    empty_cache,
     format_duration,
     get_readme_intro,
     get_trial_parameters,
+    is_hf_path,
     load_prompts,
     print,
     print_memory_usage,
@@ -66,10 +74,12 @@ from .utils import (
     prompt_path,
     prompt_select,
     prompt_text,
+    set_seed,
+    upload_reproduce_folder,
 )
 
 
-def obtain_merge_strategy(settings: Settings) -> str | None:
+def obtain_merge_strategy(settings: Settings, model: Model) -> str | None:
     """
     Prompts the user for how to proceed with saving the model.
     Provides info to the user if the model is quantized on memory use.
@@ -98,7 +108,8 @@ def obtain_merge_strategy(settings: Settings) -> str | None:
                     settings.model,
                     device_map="meta",
                     torch_dtype=torch.bfloat16,
-                    trust_remote_code=True,
+                    trust_remote_code=model.trusted_models.get(settings.model),
+                    **model.revision_kwargs,
                 )
                 footprint_bytes = meta_model.get_memory_footprint()
                 footprint_gb = footprint_bytes / (1024**3)
@@ -186,46 +197,12 @@ def run():
         )
         return
 
-    # Adapted from https://github.com/huggingface/accelerate/blob/main/src/accelerate/commands/env.py
-    if torch.cuda.is_available():
-        count = torch.cuda.device_count()
-        total_vram = sum(torch.cuda.mem_get_info(i)[1] for i in range(count))
-        print(
-            f"Detected [bold]{count}[/] CUDA device(s) ({total_vram / (1024**3):.2f} GB total VRAM):"
-        )
-        for i in range(count):
-            vram = torch.cuda.mem_get_info(i)[1] / (1024**3)
-            print(
-                f"* GPU {i}: [bold]{torch.cuda.get_device_name(i)}[/] ({vram:.2f} GB)"
-            )
-    elif is_xpu_available():
-        count = torch.xpu.device_count()
-        print(f"Detected [bold]{count}[/] XPU device(s):")
-        for i in range(count):
-            print(f"* XPU {i}: [bold]{torch.xpu.get_device_name(i)}[/]")
-    elif is_mlu_available():
-        count = torch.mlu.device_count()  # ty:ignore[unresolved-attribute]
-        print(f"Detected [bold]{count}[/] MLU device(s):")
-        for i in range(count):
-            print(f"* MLU {i}: [bold]{torch.mlu.get_device_name(i)}[/]")  # ty:ignore[unresolved-attribute]
-    elif is_sdaa_available():
-        count = torch.sdaa.device_count()  # ty:ignore[unresolved-attribute]
-        print(f"Detected [bold]{count}[/] SDAA device(s):")
-        for i in range(count):
-            print(f"* SDAA {i}: [bold]{torch.sdaa.get_device_name(i)}[/]")  # ty:ignore[unresolved-attribute]
-    elif is_musa_available():
-        count = torch.musa.device_count()  # ty:ignore[unresolved-attribute]
-        print(f"Detected [bold]{count}[/] MUSA device(s):")
-        for i in range(count):
-            print(f"* MUSA {i}: [bold]{torch.musa.get_device_name(i)}[/]")  # ty:ignore[unresolved-attribute]
-    elif is_npu_available():
-        print(f"NPU detected (CANN version: [bold]{torch.version.cann}[/])")  # ty:ignore[unresolved-attribute]
-    elif torch.backends.mps.is_available():
-        print("Detected [bold]1[/] MPS device (Apple Metal)")
-    else:
-        print(
-            "[bold yellow]No GPU or other accelerator detected. Operations will be slow.[/]"
-        )
+    if settings.seed is None:
+        settings.seed = random.randint(0, 2**32 - 1)
+
+    set_seed(settings.seed)
+
+    print(get_accelerator_info())
 
     # We don't need gradients as we only do inference.
     torch.set_grad_enabled(False)
@@ -445,13 +422,36 @@ def run():
 
     print()
     print("Calculating per-layer refusal directions...")
-    print("* Obtaining residuals for good prompts...")
-    good_residuals = model.get_residuals_batched(good_prompts)
-    print("* Obtaining residuals for bad prompts...")
-    bad_residuals = model.get_residuals_batched(bad_prompts)
 
-    good_means = good_residuals.mean(dim=0)
-    bad_means = bad_residuals.mean(dim=0)
+    needs_full_residuals = settings.print_residual_geometry or settings.plot_residuals
+
+    good_residuals = None
+    bad_residuals = None
+
+    if needs_full_residuals:
+        print("* Obtaining residuals for good prompts...")
+        good_residuals = model.get_residuals_batched(good_prompts)
+        print("* Obtaining residuals for bad prompts...")
+        bad_residuals = model.get_residuals_batched(bad_prompts)
+
+        good_means = good_residuals.mean(dim=0)
+        bad_means = bad_residuals.mean(dim=0)
+
+        analyzer = Analyzer(settings, model, good_residuals, bad_residuals)
+
+        if settings.print_residual_geometry:
+            analyzer.print_residual_geometry()
+
+        if settings.plot_residuals:
+            analyzer.plot_residuals()
+
+        # We don't need the full residuals after computing their means and analyzing geometry.
+        del good_residuals, bad_residuals, analyzer
+    else:
+        print("* Obtaining residual mean for good prompts...")
+        good_means = model.get_residuals_mean(good_prompts)
+        print("* Obtaining residual mean for bad prompts...")
+        bad_means = model.get_residuals_mean(bad_prompts)
 
     refusal_directions = F.normalize(bad_means - good_means, p=2, dim=1)
 
@@ -466,16 +466,7 @@ def run():
         )
         refusal_directions = F.normalize(refusal_directions, p=2, dim=1)
 
-    analyzer = Analyzer(settings, model, good_residuals, bad_residuals)
-
-    if settings.print_residual_geometry:
-        analyzer.print_residual_geometry()
-
-    if settings.plot_residuals:
-        analyzer.plot_residuals()
-
-    # We don't need the residuals after computing refusal directions.
-    del good_residuals, bad_residuals, analyzer
+    # Clear cache before starting the optimization study.
     empty_cache()
 
     trial_index = 0
@@ -581,6 +572,8 @@ def run():
 
         trial.set_user_attr("kl_divergence", kl_divergence)
         trial.set_user_attr("refusals", refusals)
+        trial.set_user_attr("base_refusals", evaluator.base_refusals)
+        trial.set_user_attr("n_bad_prompts", len(evaluator.bad_prompts))
 
         return score
 
@@ -597,6 +590,7 @@ def run():
             n_startup_trials=settings.n_startup_trials,
             n_ei_candidates=128,
             multivariate=True,
+            seed=settings.seed,
         ),
         directions=[StudyDirection.MINIMIZE, StudyDirection.MINIMIZE],
         storage=storage,
@@ -780,17 +774,23 @@ def run():
                             if not save_directory:
                                 continue
 
-                            strategy = obtain_merge_strategy(settings)
+                            strategy = obtain_merge_strategy(settings, model)
                             if strategy is None:
                                 continue
 
                             if strategy == "adapter":
                                 print("Saving LoRA adapter...")
-                                model.model.save_pretrained(save_directory)
+                                model.model.save_pretrained(
+                                    save_directory,
+                                    max_shard_size=settings.max_shard_size,
+                                )
                             else:
                                 print("Saving merged model...")
                                 merged_model = model.get_merged_model()
-                                merged_model.save_pretrained(save_directory)
+                                merged_model.save_pretrained(
+                                    save_directory,
+                                    max_shard_size=settings.max_shard_size,
+                                )
                                 del merged_model
                                 empty_cache()
                                 model.tokenizer.save_pretrained(save_directory)
@@ -831,15 +831,60 @@ def run():
                                 continue
                             private = visibility == "Private"
 
-                            strategy = obtain_merge_strategy(settings)
+                            strategy = obtain_merge_strategy(settings, model)
                             if strategy is None:
                                 continue
+
+                            # Reproducibility requires that the model and all datasets
+                            # are available on the Hugging Face Hub (not local paths).
+                            datasets = [
+                                settings.good_prompts.dataset,
+                                settings.bad_prompts.dataset,
+                                settings.good_evaluation_prompts.dataset,
+                                settings.bad_evaluation_prompts.dataset,
+                            ]
+                            is_reproducible = is_hf_path(settings.model) and all(
+                                is_hf_path(dataset) for dataset in datasets
+                            )
+
+                            if is_reproducible:
+                                print(
+                                    (
+                                        "Heretic can add information to the repository that allows others to reproduce the model. "
+                                        "This is optional, but valuable to the community as both a learning tool and to preserve computational work already done. "
+                                        "Guaranteeing reproducibility requires basic system information (Python and OS version, CPU and GPU/accelerator info) "
+                                        "as tensor operations can give different results in different system environments. "
+                                        "[bold]The information does not include any file system paths or other private data.[/]"
+                                    )
+                                )
+                                reproducibility_information = prompt_select(
+                                    "Which reproducibility information do you want to add?",
+                                    [
+                                        Choice(
+                                            title="Full: Settings, package versions, and system information",
+                                            value="full",
+                                        ),
+                                        Choice(
+                                            title="Basic: Settings and package versions",
+                                            value="basic",
+                                        ),
+                                        Choice(
+                                            title="Don't add any reproducibility information",
+                                            value="none",
+                                        ),
+                                    ],
+                                )
+                                if reproducibility_information is None:
+                                    continue
+                            else:
+                                reproducibility_information = "none"
 
                             if strategy == "adapter":
                                 print("Uploading LoRA adapter...")
                                 model.model.push_to_hub(
                                     repo_id,
                                     private=private,
+                                    max_shard_size=settings.max_shard_size,
                                     token=token,
                                 )
                             else:
@@ -848,6 +893,7 @@ def run():
                                 merged_model.push_to_hub(
                                     repo_id,
                                     private=private,
+                                    max_shard_size=settings.max_shard_size,
                                     token=token,
                                 )
                                 del merged_model
@@ -858,22 +904,18 @@ def run():
                                     token=token,
                                 )
 
-                            # If the model path exists locally and includes the
-                            # card, use it directly. If the model path doesn't
-                            # exist locally, it can be assumed to be a model
-                            # hosted on the Hugging Face Hub, in which case
-                            # we can retrieve the model card.
-                            model_path = Path(settings.model)
-                            if model_path.exists():
+                            if is_hf_path(settings.model):
+                                card = ModelCard.load(settings.model)
+                            else:
                                 card_path = (
-                                    model_path / huggingface_hub.constants.REPOCARD_NAME
+                                    Path(settings.model)
+                                    / huggingface_hub.constants.REPOCARD_NAME
                                 )
                                 if card_path.exists():
                                     card = ModelCard.load(card_path)
                                 else:
                                     card = None
-                            else:
-                                card = ModelCard.load(settings.model)
+
                             if card is not None:
                                 if card.data is None:
                                     card.data = ModelCardData()
@@ -883,16 +925,33 @@ def run():
                                 card.data.tags.append("uncensored")
                                 card.data.tags.append("decensored")
                                 card.data.tags.append("abliterated")
+                                if reproducibility_information != "none":
+                                    card.data.tags.append("reproducible")
                                 card.text = (
                                     get_readme_intro(
                                         settings,
                                         trial,
-                                        evaluator.base_refusals,
-                                        evaluator.bad_prompts,
+                                        reproducibility_information != "none",
                                     )
                                     + card.text
                                 )
                                 card.push_to_hub(repo_id, token=token)
+
+                            if reproducibility_information != "none":
+                                # Set the number of trials to the number of actual completed trials
+                                # for the reproduction configuration.
+                                settings.n_trials = count_completed_trials()
+
+                                upload_reproduce_folder(
+                                    repo_id,
+                                    settings,
+                                    token,
+                                    checkpoint_path=study_checkpoint_file,
+                                    trial=trial,
+                                    include_system_information=(
+                                        reproducibility_information == "full"
+                                    ),
+                                )
 
                             print(f"Model uploaded to [bold]{repo_id}[/].")
 
